@@ -7,14 +7,20 @@ from scipy.spatial.distance import cdist
 import scipy.ndimage
 import lap # pip install lap
 import umap
-from math import floor, sqrt
+from math import floor, sqrt, ceil
 import copy
 import torch as t
 import torchvision as tv
 import torch.nn as nn
+from tqdm import tqdm
+import threading
+from queue import Queue
 
 def load_img(file):
     return PIL.Image.open(file).convert('RGB')
+
+def from_device(tensor):
+    return tensor.detach().cpu().numpy()
 
 # Show an image within a Jupyter environment
 # Can do PyTorch tensors, NumPy arrays, file paths, and PIL images
@@ -71,60 +77,70 @@ def get_all_files(folder, extension=None):
     for root, dirs, files in os.walk(folder):
         for file in files:
             if extension and file.endswith(extension) or extension is None:
-                all_files.append(f'{root}/{file}')
+                try: 
+                    img = PIL.Image.open(os.path.join(root, file)) # If PIL can't open it we don't want it
+                    all_files.append(f'{root}/{file}')
+                except:
+                    continue
     return all_files
 
 def new_dir(folder):
     if not os.path.exists(folder): os.makedirs(folder)
 
-def umap_to_lapjv(img_files, features_UMAP, thumb_size):
+def plot_features(files, features, num_datapoints=None, thumb_size=32, thumbs=None, num_workers=32, html=False, grid=False):
     
-    # https://gist.github.com/vmarkovtsev/74e3a973b19113047fdb6b252d741b42
-    # https://github.com/gatagat/lap
+    if num_datapoints is None:
+        assert features.shape[0] == len(files)
+        num_datapoints = len(files)
     
-    gs = floor(sqrt(features_UMAP.shape[0]))
-    samples = gs*gs # Determine number of data points to keep
-    print(f'Grid size: {gs}x{gs}, samples: {samples}')
+    if grid:
+        print('Computing grid')
+        
+        # https://gist.github.com/vmarkovtsev/74e3a973b19113047fdb6b252d741b42
+        # https://github.com/gatagat/lap
     
-    # Cut excess data points
-    img_files = img_files[:samples]
-    features_UMAP = features_UMAP[:samples]
-
-    # Make grid
-    grid = np.dstack(np.meshgrid(np.linspace(0, 1, gs), np.linspace(0, 1, gs))).reshape(-1, 2)
-
-    cost_matrix = cdist(grid, features_UMAP, "sqeuclidean").astype(np.float32)
-    cost, row_asses, col_asses = lap.lapjv(cost_matrix)
+        gs = floor(sqrt(features.shape[0]))
+        samples = gs*gs # Determine number of data points to keep
+        print(f'Grid size: {gs}x{gs}, samples: {samples}')
     
-    grid_jv = grid[col_asses]
+        # Cut excess data points
+        files = files[:samples]
+        features = features[:samples]
 
-    return grid_jv, img_files
+        # Make grid
+        grid = np.dstack(np.meshgrid(np.linspace(0, 1, gs), np.linspace(0, 1, gs))).reshape(-1, 2)
 
-def plot_features(img_files, features, thumb_size=64):
+        cost_matrix = cdist(grid, features, "sqeuclidean").astype(np.float32)
+        cost, row_asses, col_asses = lap.lapjv(cost_matrix)
     
-    html_map = []
+        features = grid[col_asses]
 
+    if html:
+        html_map = []
+
+    # Generate thumbnails
+    if thumbs is None:
+        print('Generating thumbnails in parallel')
+        thumbs = _thumbnails_parallel(files, thumb_size, num_workers)
+    
     # Find max. and min. feature values
     value_max = np.max(features)
     value_min = np.min(features)
     
     # Determine max possible grid size
-    gs = thumb_size * floor(sqrt(features.shape[0]))
+    gs = thumb_size * floor(sqrt(num_datapoints))
     
     # Calculate size of the plot based on these values
     canvas_size = int((abs(value_max) + abs(value_min)) * gs) + thumb_size # Images are anchored at upper left corner
-    print(f'Canvas size: {canvas_size}')
 
     # Define plot as empty (white) canvas
     canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 255
 
-    for i, img_file in enumerate(img_files):
-        
-        # Read image, resize, and convert to NumPy array
-        img = load_img(img_file)
-        img = _smart_resize(img, thumb_size)
-        img = np.array(img)
-        
+    print('Plotting image')
+    for i, file in enumerate(files):
+    
+        img = thumbs[file]
+    
         # Read features and calculate x,y
         y = int((features[i,0] + abs(value_min)) * gs)
         x = int((features[i,1] + abs(value_min)) * gs)   
@@ -132,12 +148,57 @@ def plot_features(img_files, features, thumb_size=64):
         # Plot image
         canvas[y:y+img.shape[0],x:x+img.shape[1],:] = img
         
-        # Add to HTML map area list
-        mapstring = f'<area shape="rect" coords="{x},{y},{x + img.shape[1]},{y + img.shape[0]}" href="{img_file}" alt=""/>'
-        html_map.append(mapstring)
+        if html:
+            # Add to HTML map area list
+            mapstring = f'<area shape="rect" coords="{x},{y},{x + img.shape[1]},{y + img.shape[0]}" href="{files[i]}" alt=""/>'
+            html_map.append(mapstring)
+    
+    if html:
+        # Return plot and HTML map area list
+        print('Writing HTML map')
+        return canvas, html_map, thumbs
+    else:
+        return canvas, thumbs
+
+def _thumbnails_parallel(files, thumb_size, num_workers):
+    d = dict()
+    q = Queue()
+    l = threading.Lock()
+   
+    def _worker(thumb_size, d):
+        while True:
+            file = q.get() 
+            d[file] = np.array(_smart_resize(load_img(file), thumb_size))
+            q.task_done()
             
-    # Return plot and HTML map area list
-    return canvas, html_map
+    for i in range(num_workers):
+        t = threading.Thread(target=_worker, args=(thumb_size,d,))
+        t.daemon = True  # Thread dies when main thread (only non-daemon thread) exits.
+        t.start()
+        
+    for file in files:
+        q.put(file)
+        
+    q.join()
+    return d
+
+class UnsupervisedImageDataset(t.utils.data.Dataset):
+
+    def __init__(self, folder, extension=None, transforms=None):
+        self.folder = folder
+        self.transforms = transforms
+        self.files = get_all_files(folder, extension)
+        
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        if t.is_tensor(idx):
+            idx = idx.tolist()
+        sample = load_img(self.files[idx])
+        if self.transforms:
+            sample = self.transforms(sample)
+        return sample
 
 def train_model(model, dataloaders, criterion, optimizer, device, epochs):
 
